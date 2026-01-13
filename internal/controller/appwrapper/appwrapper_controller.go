@@ -239,6 +239,34 @@ func (r *AppWrapperReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				return ctrl.Result{}, r.resetOrFail(ctx, orig, aw, false, 1)
 			}
 		}
+
+		// Check if sufficient resources are available on at least one node before transitioning to Running
+		resourcesAvailable, err := r.checkResourceAvailability(ctx, aw)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "Error checking resource availability")
+			// Don't fail the AppWrapper, just requeue and retry
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if !resourcesAvailable {
+			// Resources are fragmented or insufficient; stay in Resuming and wait
+			startTime := meta.FindStatusCondition(aw.Status.Conditions, string(awv1beta2.ResourcesDeployed)).LastTransitionTime
+			graceDuration := r.admissionGraceDuration(ctx, aw)
+			if time.Now().Before(startTime.Add(graceDuration)) {
+				log.FromContext(ctx).Info("Insufficient unfragmented resources available, waiting for resources to become available")
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			// Grace period expired, trigger reset or fail
+			detailMsg := "Insufficient unfragmented resources available within admission grace period"
+			meta.SetStatusCondition(&aw.Status.Conditions, metav1.Condition{
+				Type:    string(awv1beta2.Unhealthy),
+				Status:  metav1.ConditionTrue,
+				Reason:  "InsufficientResources",
+				Message: detailMsg,
+			})
+			r.Recorder.Event(aw, v1.EventTypeNormal, string(awv1beta2.Unhealthy), "InsufficientResources: "+detailMsg)
+			return ctrl.Result{}, r.resetOrFail(ctx, orig, aw, false, 1)
+		}
+
 		return ctrl.Result{}, r.transitionToPhase(ctx, orig, aw, awv1beta2.AppWrapperRunning)
 
 	case awv1beta2.AppWrapperRunning: // components deployed

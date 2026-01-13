@@ -497,3 +497,250 @@ func (r *AppWrapperReconciler) deleteComponents(ctx context.Context, aw *awv1bet
 	// requeue deletion
 	return false
 }
+
+// checkResourceAvailability verifies that at least one node has sufficient resources
+// to satisfy each pod's resource requirements (especially GPUs).
+// This prevents transitioning to Running when resources are fragmented across nodes.
+func (r *AppWrapperReconciler) checkResourceAvailability(ctx context.Context, aw *awv1beta2.AppWrapper) (bool, error) {
+	// Extract all pod resource requirements from the AppWrapper
+	podRequests, err := r.extractPodResourceRequests(ctx, aw)
+	if err != nil {
+		return false, err
+	}
+
+	// If no pods request GPUs or other extended resources, skip the check
+	if len(podRequests) == 0 {
+		return true, nil
+	}
+
+	// Get all nodes in the cluster
+	nodes := &v1.NodeList{}
+	if err := r.List(ctx, nodes); err != nil {
+		return false, fmt.Errorf("failed to list nodes: %w", err)
+	}
+
+	// Get all pods to calculate allocated resources per node
+	pods := &v1.PodList{}
+	if err := r.List(ctx, pods); err != nil {
+		return false, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	// Build a map of allocated resources per node
+	allocatedPerNode := make(map[string]v1.ResourceList)
+	for _, pod := range pods.Items {
+		// Only count running and pending pods that haven't finished
+		if pod.Status.Phase == v1.PodRunning || pod.Status.Phase == v1.PodPending {
+			nodeName := pod.Spec.NodeName
+			if nodeName == "" {
+				// For pending pods, we can't determine node allocation yet
+				// We'll be conservative and not count them
+				continue
+			}
+			if allocatedPerNode[nodeName] == nil {
+				allocatedPerNode[nodeName] = make(v1.ResourceList)
+			}
+			for _, container := range pod.Spec.Containers {
+				for resourceName, quantity := range container.Resources.Requests {
+					existing := allocatedPerNode[nodeName][resourceName]
+					existing.Add(quantity)
+					allocatedPerNode[nodeName][resourceName] = existing
+				}
+			}
+			for _, container := range pod.Spec.InitContainers {
+				for resourceName, quantity := range container.Resources.Requests {
+					existing := allocatedPerNode[nodeName][resourceName]
+					existing.Add(quantity)
+					allocatedPerNode[nodeName][resourceName] = existing
+				}
+			}
+		}
+	}
+
+	// Get noSchedule resources to subtract from available capacity
+	noScheduleNodesMutex.RLock()
+	noScheduleResourcesCopy := make(map[string]v1.ResourceList)
+	for nodeName, resources := range noScheduleNodes {
+		noScheduleResourcesCopy[nodeName] = resources.DeepCopy()
+	}
+	noScheduleNodesMutex.RUnlock()
+
+	// Check each pod's requirements against available nodes
+	for podIdx, podRequest := range podRequests {
+		foundSuitableNode := false
+
+		for _, node := range nodes.Items {
+			// Skip unschedulable nodes
+			if node.Spec.Unschedulable {
+				continue
+			}
+
+			// Skip nodes that are not ready
+			nodeReady := false
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == v1.NodeReady && condition.Status == v1.ConditionTrue {
+					nodeReady = true
+					break
+				}
+			}
+			if !nodeReady {
+				continue
+			}
+
+			// Check if this node can satisfy the pod's requirements
+			canSchedule := true
+			for resourceName, requestedQuantity := range podRequest {
+				// Get node capacity
+				capacity := node.Status.Allocatable[resourceName]
+
+				// Subtract already allocated resources
+				allocated := allocatedPerNode[node.Name][resourceName]
+				available := capacity.DeepCopy()
+				available.Sub(allocated)
+
+				// Subtract noSchedule resources (e.g., unhealthy GPUs)
+				if noScheduleRes, exists := noScheduleResourcesCopy[node.Name]; exists {
+					if noScheduleQuantity, hasResource := noScheduleRes[resourceName]; hasResource {
+						available.Sub(noScheduleQuantity)
+					}
+				}
+
+				// Check if available resources are sufficient
+				if available.Cmp(requestedQuantity) < 0 {
+					canSchedule = false
+					break
+				}
+			}
+
+			if canSchedule {
+				foundSuitableNode = true
+				log.FromContext(ctx).V(1).Info("Found suitable node for pod",
+					"podIndex", podIdx,
+					"nodeName", node.Name,
+					"podRequests", podRequest)
+				break
+			}
+		}
+
+		if !foundSuitableNode {
+			log.FromContext(ctx).Info("No suitable node found with sufficient resources",
+				"podIndex", podIdx,
+				"podRequests", podRequest,
+				"appwrapper", aw.Name)
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// extractPodResourceRequests extracts resource requests from all pods in the AppWrapper
+// Returns a slice of ResourceLists, one per pod that requests extended resources
+func (r *AppWrapperReconciler) extractPodResourceRequests(ctx context.Context, aw *awv1beta2.AppWrapper) ([]v1.ResourceList, error) {
+	var podRequests []v1.ResourceList
+
+	// Iterate through all components
+	for componentIdx, component := range aw.Spec.Components {
+		componentStatus := aw.Status.ComponentStatus[componentIdx]
+
+		obj, err := parseComponent(component.Template.Raw, aw.Namespace)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse component %d: %w", componentIdx, err)
+		}
+
+		// Extract pod specs from the component
+		for _, podSet := range componentStatus.PodSets {
+			podTemplateSpec, err := utils.GetRawTemplate(obj.UnstructuredContent(), podSet.Path)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get pod template at path %s: %w", podSet.Path, err)
+			}
+
+			spec, ok := podTemplateSpec["spec"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// Extract resource requests from containers
+			requests := make(v1.ResourceList)
+			hasExtendedResources := false
+
+			extractFromContainers := func(containerList []interface{}) {
+				for _, containerI := range containerList {
+					container, ok := containerI.(map[string]interface{})
+					if !ok {
+						continue
+					}
+
+					resources, ok := container["resources"].(map[string]interface{})
+					if !ok {
+						continue
+					}
+
+					requestsMap, ok := resources["requests"].(map[string]interface{})
+					if !ok {
+						continue
+					}
+
+					for resourceName, quantityI := range requestsMap {
+						// Parse quantity
+						var quantity kresource.Quantity
+						switch v := quantityI.(type) {
+						case string:
+							parsed, err := kresource.ParseQuantity(v)
+							if err != nil {
+								continue
+							}
+							quantity = parsed
+						case int:
+							quantity = *kresource.NewQuantity(int64(v), kresource.DecimalSI)
+						case int32:
+							quantity = *kresource.NewQuantity(int64(v), kresource.DecimalSI)
+						case int64:
+							quantity = *kresource.NewQuantity(v, kresource.DecimalSI)
+						default:
+							continue
+						}
+
+						resourceNameTyped := v1.ResourceName(resourceName)
+
+						// Check if this is an extended resource (not CPU or memory)
+						// Extended resources need per-node checking
+						if resourceNameTyped != v1.ResourceCPU && resourceNameTyped != v1.ResourceMemory {
+							hasExtendedResources = true
+						}
+
+						// Accumulate requests (for multiple containers in same pod)
+						existing := requests[resourceNameTyped]
+						existing.Add(quantity)
+						requests[resourceNameTyped] = existing
+					}
+				}
+			}
+
+			// Extract from regular containers
+			if containers, ok := spec["containers"].([]interface{}); ok {
+				extractFromContainers(containers)
+			}
+
+			// Extract from init containers (they also need resources)
+			if initContainers, ok := spec["initContainers"].([]interface{}); ok {
+				extractFromContainers(initContainers)
+			}
+
+			// Only add to list if this pod requests extended resources (like GPUs)
+			if hasExtendedResources && len(requests) > 0 {
+				// Get the number of replicas for this podset
+				replicas := int32(1)
+				if podSet.Replicas != nil {
+					replicas = *podSet.Replicas
+				}
+
+				// Add one entry per replica
+				for i := int32(0); i < replicas; i++ {
+					podRequests = append(podRequests, requests.DeepCopy())
+				}
+			}
+		}
+	}
+
+	return podRequests, nil
+}
